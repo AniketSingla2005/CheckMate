@@ -157,3 +157,185 @@ add_student() {
     
     show_success "Student '$name' has been added successfully"
 }
+
+# Function to list all students
+list_students() {
+    # Create a temporary file for the student list
+    local temp_list="/tmp/student_list.$$"
+    
+    # Create header for the list
+    echo -e "ID\tNAME\tEMAIL\tCLASS" > "$temp_list"
+    echo -e "------------------------------------------------------" >> "$temp_list"
+    
+    # Skip header line and format student data
+    tail -n +2 "$STUDENTS_FILE" | sed 's/,/\t/g' >> "$temp_list"
+    
+    # Display the list using dialog
+    dialog --title "Student List" --textbox "$temp_list" $DIALOG_HEIGHT $DIALOG_WIDTH
+    
+    # Clean up
+    rm -f "$temp_list"
+    
+    # Log action
+    log_action "List" "Viewed student list"
+}
+
+# Function to delete a student
+delete_student() {
+    # Create a temporary file for student choices
+    local temp_choices="/tmp/student_choices.$$"
+    
+    # Generate list of students for selection
+    echo -n "" > "$temp_choices"
+    local line_num=1
+    tail -n +2 "$STUDENTS_FILE" | while IFS=, read -r id name email class; do
+        echo "$id \"$name ($class)\"" >> "$temp_choices"
+        ((line_num++))
+    done
+    
+    # Check if there are students to delete
+    if [ ! -s "$temp_choices" ]; then
+        show_error "No students found in the system"
+        rm -f "$temp_choices"
+        return
+    fi
+    
+    # Display menu to select a student
+    dialog --title "Delete Student" \
+           --menu "Select a student to delete:" \
+           $DIALOG_HEIGHT $DIALOG_WIDTH $((line_num > 10 ? 10 : line_num)) \
+           --file "$temp_choices" \
+           2> "$TEMP_FILE"
+    
+    # Check if user cancelled
+    if [ $? -ne 0 ]; then
+        rm -f "$temp_choices" "$TEMP_FILE"
+        return
+    fi
+    
+    # Get selected student ID
+    local selected_id=$(cat "$TEMP_FILE")
+    rm -f "$temp_choices" "$TEMP_FILE"
+    
+    # Confirm deletion
+    dialog --title "Confirm Deletion" \
+           --yesno "Are you sure you want to delete student with ID '$selected_id'?" \
+           8 60
+    
+    # If confirmed, delete the student
+    if [ $? -eq 0 ]; then
+        # Get student name for logging
+        local student_name=$(grep "^$selected_id," "$STUDENTS_FILE" | cut -d',' -f2)
+        
+        # Create a temporary file without the selected student
+        grep -v "^$selected_id," "$STUDENTS_FILE" > "$TEMP_FILE"
+        
+        # Replace original file
+        mv "$TEMP_FILE" "$STUDENTS_FILE"
+        
+        # Delete student attendance records
+        if [ -f "$ATTENDANCE_DIR/$selected_id.csv" ]; then
+            rm -f "$ATTENDANCE_DIR/$selected_id.csv"
+        fi
+        
+        # Log action
+        log_action "Delete" "Deleted student $selected_id: $student_name"
+        
+        show_success "Student with ID '$selected_id' has been deleted"
+    fi
+}
+
+# Function to record attendance for a date
+record_attendance() {
+    # Ask for date (default to today)
+    local default_date=$(date +"%Y-%m-%d")
+    dialog --title "Record Attendance" \
+           --inputbox "Enter date (YYYY-MM-DD) or leave blank for today:" \
+           8 50 "$default_date" \
+           2> "$TEMP_FILE"
+    
+    # Check if user cancelled
+    if [ $? -ne 0 ]; then
+        rm -f "$TEMP_FILE"
+        return
+    fi
+    
+    local selected_date=$(cat "$TEMP_FILE")
+    rm -f "$TEMP_FILE"
+    
+    # Validate date format
+    if [ -n "$selected_date" ] && ! date -d "$selected_date" >/dev/null 2>&1; then
+        show_error "Invalid date format. Please use YYYY-MM-DD"
+        return
+    fi
+    
+    # If blank, use today's date
+    if [ -z "$selected_date" ]; then
+        selected_date="$default_date"
+    fi
+    
+    # Create a checklist of students
+    local temp_checklist="/tmp/attendance_checklist.$$"
+    echo -n "" > "$temp_checklist"
+    
+    # Check if there are students
+    if [ $(tail -n +2 "$STUDENTS_FILE" | wc -l) -eq 0 ]; then
+        show_error "No students found in the system"
+        rm -f "$temp_checklist"
+        return
+    fi
+    
+    # Generate student checklist
+    tail -n +2 "$STUDENTS_FILE" | while IFS=, read -r id name email class; do
+        # Check if student was previously marked present
+        local status="off"
+        if [ -f "$ATTENDANCE_DIR/$selected_date.csv" ]; then
+            if grep -q "^$id," "$ATTENDANCE_DIR/$selected_date.csv"; then
+                status="on"
+            fi
+        fi
+        echo "$id \"$name ($class)\" $status" >> "$temp_checklist"
+    done
+    
+    # Display checklist for attendance
+    dialog --title "Attendance for $selected_date" \
+           --checklist "Mark present students:" \
+           $DIALOG_HEIGHT $DIALOG_WIDTH 15 \
+           --file "$temp_checklist" \
+           2> "$TEMP_FILE"
+    
+    # Check if user cancelled
+    if [ $? -ne 0 ]; then
+        rm -f "$temp_checklist" "$TEMP_FILE"
+        return
+    fi
+    
+    # Process selected students
+    local present_students=$(cat "$TEMP_FILE" | tr -d '"')
+    rm -f "$temp_checklist" "$TEMP_FILE"
+    
+    # Create or clear the attendance file for this date
+    echo "id,status,timestamp" > "$ATTENDANCE_DIR/$selected_date.csv"
+    
+    # Mark all students as absent by default
+    tail -n +2 "$STUDENTS_FILE" | while IFS=, read -r id name email class; do
+        local status="absent"
+        local current_time=$(date "+%H:%M:%S")
+        
+        # Check if this student is in the present list
+        for present_id in $present_students; do
+            if [ "$id" = "$present_id" ]; then
+                status="present"
+                break
+            fi
+        done
+        
+        # Record attendance
+        echo "$id,$status,$current_time" >> "$ATTENDANCE_DIR/$selected_date.csv"
+    done
+    
+    # Log action
+    log_action "Attendance" "Recorded attendance for $selected_date"
+    
+    show_success "Attendance for $selected_date has been recorded"
+}
